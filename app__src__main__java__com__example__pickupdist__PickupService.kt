@@ -2,10 +2,14 @@ package com.example.pickupdist
 
 import android.accessibilityservice.AccessibilityService
 import android.annotation.SuppressLint
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Rect
 import android.graphics.drawable.GradientDrawable
+import android.net.Uri
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -14,20 +18,13 @@ import android.view.WindowManager
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 import android.widget.TextView
-import android.widget.Toast
-import com.google.android.gms.location.LocationServices
-import com.google.android.gms.location.Priority
-import kotlinx.coroutines.*
-import kotlinx.coroutines.tasks.await
 import kotlin.math.abs
 
 class PickupService : AccessibilityService() {
 
     private lateinit var wm: WindowManager
     private var button: TextView? = null
-    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private val handler = Handler(Looper.getMainLooper())
-    private var busy = false
 
     override fun onServiceConnected() {
         wm = getSystemService(WINDOW_SERVICE) as WindowManager
@@ -38,7 +35,6 @@ class PickupService : AccessibilityService() {
     override fun onInterrupt() {}
 
     override fun onDestroy() {
-        scope.cancel()
         button?.let { runCatching { wm.removeView(it) } }
         super.onDestroy()
     }
@@ -92,7 +88,7 @@ class PickupService : AccessibilityService() {
         button = tv
     }
 
-    private fun showOnButton(text: String, holdMs: Long = 10_000) {
+    private fun showOnButton(text: String, holdMs: Long = 5_000) {
         val b = button ?: return
         b.text = text
         b.textSize = 13f
@@ -116,53 +112,36 @@ class PickupService : AccessibilityService() {
         wm.updateViewLayout(b, lp)
     }
 
-    // ---------- Xử lý khi bấm ----------
+    // ---------- Xử lý khi bấm: đọc điểm đón -> chép vào clipboard -> mở Google Maps ----------
 
     private fun onTap() {
-        if (busy) return
-        busy = true
-        showOnButton("Đang tìm…", 15_000)
-        scope.launch {
-            try {
-                val msg = withTimeoutOrNull(20_000) {
-                    withContext(Dispatchers.Default) { compute() }
-                } ?: "Quá 20 giây, thử lại"
-                showOnButton(msg)
-            } catch (e: Exception) {
-                showOnButton("Lỗi: ${e.message?.take(40)}", 6_000)
-            } finally {
-                busy = false
-            }
-        }
+        val root = rootInActiveWindow
+        if (root == null) { showOnButton("Không đọc được màn hình"); return }
+
+        val trip = TripParser.parse(collectTexts(root))
+        if (trip == null) { showOnButton("Không thấy cuốc xe"); return }
+
+        val q = trip.pickupQuery
+
+        // 1) Chép sẵn vào clipboard (dự phòng nếu Maps không tự mở)
+        val cm = getSystemService(CLIPBOARD_SERVICE) as ClipboardManager
+        cm.setPrimaryClip(ClipData.newPlainText("diem don", q))
+        showOnButton("Đã chép: " + q.take(28))
+
+        // 2) Mở Google Maps chỉ đường từ vị trí hiện tại tới điểm đón (xe máy)
+        openMaps(q)
     }
 
-    @SuppressLint("MissingPermission")
-    private suspend fun compute(): String {
-        val key = getSharedPreferences("cfg", MODE_PRIVATE).getString("goong_key", "").orEmpty()
-        if (key.isBlank()) return "Chưa nhập API key"
-
-        val root = rootInActiveWindow ?: return "Không đọc được màn hình"
-        val texts = collectTexts(root)
-        val trip = TripParser.parse(texts) ?: return "Không thấy cuốc xe"
-
-        val fused = LocationServices.getFusedLocationProviderClient(this)
-        // Vị trí cuối cùng thường có sẵn ngay (app Xanh SM đang bật GPS); chỉ khi quá cũ mới hỏi GPS mới, tối đa 4s
-        val loc = runCatching { fused.lastLocation.await() }.getOrNull()
-            ?.takeIf { System.currentTimeMillis() - it.time < 120_000 }
-            ?: withTimeoutOrNull(4_000) {
-                runCatching {
-                    fused.getCurrentLocation(Priority.PRIORITY_HIGH_ACCURACY, null).await()
-                }.getOrNull()
-            }
-            ?: return "Không lấy được vị trí"
-        val me = LatLng(loc.latitude, loc.longitude)
-
-        val pickup = Goong.find(key, trip.pickupQuery, me) ?: return "Không tìm ra điểm đón"
-        val r = Goong.route(key, me, pickup) ?: return "Không tìm ra đường"
-
-        val km = r.meters / 1000.0
-        val min = (r.seconds / 60).toInt()
-        return "Đến điểm đón: %.1f km · ~%d phút".format(km, min)
+    private fun openMaps(q: String) {
+        val uri = Uri.parse(
+            "https://www.google.com/maps/dir/?api=1&destination=${Uri.encode(q)}&travelmode=two-wheeler"
+        )
+        val base = Intent(Intent.ACTION_VIEW, uri).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        try {
+            startActivity(Intent(base).setPackage("com.google.android.apps.maps"))
+        } catch (e: Exception) {
+            try { startActivity(base) } catch (_: Exception) { }
+        }
     }
 
     private fun collectTexts(root: AccessibilityNodeInfo): List<String> {
